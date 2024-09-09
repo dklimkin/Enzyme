@@ -117,6 +117,8 @@ static const StringSet<> InactiveGlobals = {
     "stdin",
     "_ZSt3cin",
     "_ZSt4cout",
+    "_ZNSt3__u4coutE",
+    "_ZNSt3__u5wcoutE",
     "_ZNSt3__14coutE",
     "_ZNSt3__15wcoutE",
     "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_",
@@ -350,7 +352,16 @@ const std::set<Intrinsic::ID> KnownInactiveIntrinsics = {
 
 const char *DemangledKnownInactiveFunctionsStartingWith[] = {
     // TODO this returns allocated memory and thus can be an active value
-    // "std::allocator",
+    // "std::allocator"
+    "std::__u::basic_streambuf",
+    "std::__u::basic_iostream",
+    "std::__u::basic_ios",
+    "std::__u::basic_istream",
+    "std::__u::basic_string",
+    "std::__u::basic_filebuf",
+    "std::__u::locale",
+    "std::__u::ios_base",
+    "std::__u::basic_ostream",
     "absl::log_internal::LogMessage",
     "std::chrono::_V2::steady_clock::now",
     "std::string",
@@ -612,6 +623,9 @@ bool ActivityAnalyzer::isFunctionArgumentConstant(CallInst *CI, Value *val) {
   if (Name == "MPI_Waitall" || Name == "PMPI_Waitall")
     return val != CI->getOperand(1);
 
+  if (Name == "julia.gc_loaded")
+    return val != CI->getOperand(1);
+
   // TODO interprocedural detection
   // Before potential introprocedural detection, any function without definition
   // may to be assumed to have an active use
@@ -639,6 +653,11 @@ static inline void propagateArgumentInformation(
       Name == "__lgamma_r_finite" || Name == "__lgammaf_r_finite" ||
       Name == "__lgammal_r_finite") {
 
+    propagateFromOperand(CI.getArgOperand(0));
+    return;
+  }
+
+  if (Name == "julia.gc_loaded") {
     propagateFromOperand(CI.getArgOperand(0));
     return;
   }

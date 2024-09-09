@@ -570,6 +570,28 @@ void ErrorIfRuntimeInactive(llvm::IRBuilder<> &B, llvm::Value *primal,
   call->setDebugLoc(loc);
 }
 
+Type *BlasInfo::fpType(LLVMContext &ctx) const {
+  if (floatType == "d" || floatType == "D") {
+    return Type::getDoubleTy(ctx);
+  } else if (floatType == "s" || floatType == "S") {
+    return Type::getFloatTy(ctx);
+  } else if (floatType == "c" || floatType == "C") {
+    return VectorType::get(Type::getFloatTy(ctx), 2, false);
+  } else if (floatType == "z" || floatType == "Z") {
+    return VectorType::get(Type::getDoubleTy(ctx), 2, false);
+  } else {
+    assert(false && "Unreachable");
+    return nullptr;
+  }
+}
+
+IntegerType *BlasInfo::intType(LLVMContext &ctx) const {
+  if (is64)
+    return IntegerType::get(ctx, 64);
+  else
+    return IntegerType::get(ctx, 32);
+}
+
 /// Create function for type that is equivalent to memcpy but adds to
 /// destination rather than a direct copy; dst, src, numelems
 Function *getOrInsertDifferentialFloatMemcpy(Module &M, Type *elementType,
@@ -1209,8 +1231,8 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
     B3.setFastMathFlags(getFast());
     Value *blasA = B3.CreatePointerCast(matA, BlasPT);
     Value *blasB = B3.CreatePointerCast(matB, BlasPT);
-    Value *fastSum = B3.CreateCall(
-        FDot, {blasSize, blasA, blasOne, blasB, blasOne}, bundles);
+    Value *fastSum =
+        B3.CreateCall(FDot, {blasSize, blasA, blasOne, blasB, blasOne});
     B3.CreateBr(end);
 
     IRBuilder<> B4(body);
@@ -1229,7 +1251,7 @@ getorInsertInnerProd(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
     Value *AiDot = B4.CreatePointerCast(Ai, BlasPT);
     Value *BiDot = B4.CreatePointerCast(Bi, BlasPT);
     Value *newDot =
-        B4.CreateCall(FDot, {blasm, AiDot, blasOne, BiDot, blasOne}, bundles);
+        B4.CreateCall(FDot, {blasm, AiDot, blasOne, BiDot, blasOne});
 
     Value *Anext = B4.CreateNUWAdd(Aidx, lda, "Aidx.next");
     Value *Bnext = B4.CreateNUWAdd(Aidx, m, "Bidx.next");
@@ -1497,10 +1519,22 @@ Function *getOrInsertCheckedFree(Module &M, CallInst *call, Type *Ty,
 
   std::string name = "__enzyme_checked_free_" + std::to_string(width);
 
+  auto callname = getFuncNameFromCall(call);
+  if (callname != "free")
+    name += "_" + callname.str();
+
   SmallVector<Type *, 3> types;
   types.push_back(Ty);
   for (unsigned i = 0; i < width; i++) {
     types.push_back(Ty);
+  }
+#if LLVM_VERSION_MAJOR >= 14
+  for (size_t i = 1; i < call->arg_size(); i++)
+#else
+  for (size_t i = 1; i < call->getNumArgOperands(); i++)
+#endif
+  {
+    types.push_back(call->getArgOperand(i)->getType());
   }
 
   FunctionType *FT =
@@ -1536,7 +1570,17 @@ Function *getOrInsertCheckedFree(Module &M, CallInst *call, Type *Ty,
   Value *isNotEqual = EntryBuilder.CreateICmpNE(primal, first_shadow);
   EntryBuilder.CreateCondBr(isNotEqual, free0, end);
 
-  CallInst *CI = Free0Builder.CreateCall(FreeTy, Free, {first_shadow});
+  SmallVector<Value *, 1> args = {first_shadow};
+#if LLVM_VERSION_MAJOR >= 14
+  for (size_t i = 1; i < call->arg_size(); i++)
+#else
+  for (size_t i = 1; i < call->getNumArgOperands(); i++)
+#endif
+  {
+    args.push_back(F->arg_begin() + width + i);
+  }
+
+  CallInst *CI = Free0Builder.CreateCall(FreeTy, Free, args);
   CI->setAttributes(FreeAttributes);
   CI->setCallingConv(CallingConvention);
 
@@ -1556,7 +1600,8 @@ Function *getOrInsertCheckedFree(Module &M, CallInst *call, Type *Ty,
                           ? Free0Builder.CreateAnd(isNotEqual, checkResult)
                           : isNotEqual;
 
-        CallInst *CI = Free1Builder.CreateCall(FreeTy, Free, {nextShadow});
+        args[0] = nextShadow;
+        CallInst *CI = Free1Builder.CreateCall(FreeTy, Free, args);
         CI->setAttributes(FreeAttributes);
         CI->setCallingConv(CallingConvention);
       }
@@ -2149,14 +2194,14 @@ bool overwritesToMemoryReadByLoop(
   return true;
 }
 
-bool overwritesToMemoryReadBy(llvm::AAResults &AA, llvm::TargetLibraryInfo &TLI,
-                              ScalarEvolution &SE, llvm::LoopInfo &LI,
-                              llvm::DominatorTree &DT,
+bool overwritesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
+                              llvm::TargetLibraryInfo &TLI, ScalarEvolution &SE,
+                              llvm::LoopInfo &LI, llvm::DominatorTree &DT,
                               llvm::Instruction *maybeReader,
                               llvm::Instruction *maybeWriter,
                               llvm::Loop *scope) {
   using namespace llvm;
-  if (!writesToMemoryReadBy(AA, TLI, maybeReader, maybeWriter))
+  if (!writesToMemoryReadBy(TR, AA, TLI, maybeReader, maybeWriter))
     return false;
   const SCEV *LoadBegin = SE.getCouldNotCompute();
   const SCEV *LoadEnd = SE.getCouldNotCompute();
@@ -2251,7 +2296,8 @@ bool overwritesToMemoryReadBy(llvm::AAResults &AA, llvm::TargetLibraryInfo &TLI,
 }
 
 /// Return whether maybeReader can read from memory written to by maybeWriter
-bool writesToMemoryReadBy(llvm::AAResults &AA, llvm::TargetLibraryInfo &TLI,
+bool writesToMemoryReadBy(const TypeResults *TR, llvm::AAResults &AA,
+                          llvm::TargetLibraryInfo &TLI,
                           llvm::Instruction *maybeReader,
                           llvm::Instruction *maybeWriter) {
   assert(maybeReader->getParent()->getParent() ==
@@ -2466,6 +2512,26 @@ bool writesToMemoryReadBy(llvm::AAResults &AA, llvm::TargetLibraryInfo &TLI,
   assert(maybeReader->mayReadFromMemory());
 
   if (auto li = dyn_cast<LoadInst>(maybeReader)) {
+    if (TR) {
+      auto TT = TR->query(li)[{-1}];
+      if (TT != BaseType::Unknown && TT != BaseType::Anything) {
+        if (auto si = dyn_cast<StoreInst>(maybeWriter)) {
+          auto TT2 = TR->query(si->getValueOperand())[{-1}];
+          if (TT2 != BaseType::Unknown && TT2 != BaseType::Anything) {
+            if (TT != TT2)
+              return false;
+          }
+          auto &dl = li->getParent()->getParent()->getParent()->getDataLayout();
+          auto len =
+              (dl.getTypeSizeInBits(si->getValueOperand()->getType()) + 7) / 8;
+          TT2 = TR->query(si->getPointerOperand()).Lookup(len, dl)[{-1}];
+          if (TT2 != BaseType::Unknown && TT2 != BaseType::Anything) {
+            if (TT != TT2)
+              return false;
+          }
+        }
+      }
+    }
     return isModSet(AA.getModRefInfo(maybeWriter, MemoryLocation::get(li)));
   }
   if (auto rmw = dyn_cast<AtomicRMWInst>(maybeReader)) {
@@ -2675,22 +2741,33 @@ getAllLoadedValuesFrom(AllocaInst *ptr0, size_t offset, size_t valSz,
     // all sub uses
     if (auto MTI = dyn_cast<MemTransferInst>(U)) {
       if (auto CI = dyn_cast<ConstantInt>(MTI->getLength())) {
-        if (MTI->getOperand(0) == ptr && suboff == 0 &&
-            CI->getValue().uge(offset + valSz)) {
-          size_t midoffset = 0;
-          auto AI2 = getBaseAndOffset(MTI->getOperand(1), midoffset);
-          if (!AI2) {
-            legal = false;
-            return options;
+        if (MTI->getOperand(0) == ptr) {
+          auto storeSz = CI->getValue();
+
+          // If store is before the load would start
+          if ((storeSz + suboff).ule(offset))
+            continue;
+
+          // if store starts after load would start
+          if (offset + valSz <= suboff)
+            continue;
+
+          if (suboff == 0 && CI->getValue().uge(offset + valSz)) {
+            size_t midoffset = 0;
+            auto AI2 = getBaseAndOffset(MTI->getOperand(1), midoffset);
+            if (!AI2) {
+              legal = false;
+              return options;
+            }
+            if (midoffset != 0) {
+              legal = false;
+              return options;
+            }
+            for (const auto &pair3 : findAllUsersOf(AI2)) {
+              todo.emplace_back(std::move(pair3));
+            }
+            continue;
           }
-          if (midoffset != 0) {
-            legal = false;
-            return options;
-          }
-          for (const auto &pair3 : findAllUsersOf(AI2)) {
-            todo.emplace_back(std::move(pair3));
-          }
-          continue;
         }
       }
     }

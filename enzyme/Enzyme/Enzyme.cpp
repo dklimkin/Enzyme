@@ -24,6 +24,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include <llvm/Config/llvm-config.h>
+#include <memory>
 
 #if LLVM_VERSION_MAJOR >= 16
 #define private public
@@ -175,8 +176,6 @@ bool attributeKnownFunctions(llvm::Function &F) {
         F.addParamAttr(i, Attribute::WriteOnly);
       }
   }
-
-  changed |= attributeTablegen(F);
 
   if (F.getName() ==
       "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE9_M_createERmm") {
@@ -377,6 +376,7 @@ bool attributeKnownFunctions(llvm::Function &F) {
           AttributeList::FunctionIndex,
           Attribute::get(F.getContext(), "enzyme_no_escaping_allocation"));
     }
+  changed |= attributeTablegen(F);
   return changed;
 }
 
@@ -794,6 +794,19 @@ public:
 
     DIFFE_TYPE retType = whatType(fn->getReturnType(), mode);
 
+    if (fn->hasParamAttribute(0, Attribute::StructRet)) {
+      Type *Ty = nullptr;
+#if LLVM_VERSION_MAJOR >= 12
+      Ty = fn->getParamAttribute(0, Attribute::StructRet).getValueAsType();
+#else
+      Type *fnsrety = cast<PointerType>(FT->getParamType(0));
+      Ty = fnsrety->getPointerElementType();
+#endif
+      if (whatType(Ty, mode) != DIFFE_TYPE::CONSTANT) {
+        retType = DIFFE_TYPE::DUP_ARG;
+      }
+    }
+
     bool returnUsed =
         !fn->getReturnType()->isVoidTy() && !fn->getReturnType()->isEmptyTy();
 
@@ -822,6 +835,12 @@ public:
           continue;
         } else if (*metaString == "enzyme_dup_return") {
           retType = DIFFE_TYPE::DUP_ARG;
+          continue;
+        } else if (*metaString == "enzyme_noret") {
+          returnUsed = false;
+          continue;
+        } else if (*metaString == "enzyme_primal_return") {
+          primalReturn = true;
           continue;
         }
       }
@@ -857,61 +876,106 @@ public:
       CTy = cast<PointerType>(CI->getArgOperand(0)->getType())
                 ->getPointerElementType();
 #endif
-      AllocaInst *primal = new AllocaInst(Ty, DL.getAllocaAddrSpace(), nullptr,
-                                          DL.getPrefTypeAlign(Ty));
+      auto FnSize = (DL.getTypeSizeInBits(Ty) / 8);
+      auto CSize = CTy ? (DL.getTypeSizeInBits(CTy) / 8) : 0;
+      auto count = ((mode == DerivativeMode::ForwardMode ||
+                     mode == DerivativeMode::ForwardModeSplit ||
+                     mode == DerivativeMode::ForwardModeError) &&
+                    (retType == DIFFE_TYPE::DUP_ARG ||
+                     retType == DIFFE_TYPE::DUP_NONEED)) *
+                       width +
+                   primalReturn;
+      if (CSize < count * FnSize) {
+        EmitFailure(
+            "IllegalByRefSize", CI->getDebugLoc(), CI, "Struct return type ",
+            *CTy, " (", CSize, " bytes), not large enough to store ", count,
+            " returns of type ", *Ty, " (", FnSize, " bytes), width=", width,
+            " primal requested=", primalReturn);
+      }
+      Value *primal = nullptr;
+      if (primalReturn) {
+        Value *sretPt = CI->getArgOperand(0);
+        PointerType *pty = cast<PointerType>(sretPt->getType());
+        primal = Builder.CreatePointerCast(
+            sretPt, PointerType::get(Ty, pty->getAddressSpace()));
+      } else {
+        AllocaInst *primalA = new AllocaInst(Ty, DL.getAllocaAddrSpace(),
+                                             nullptr, DL.getPrefTypeAlign(Ty));
+        primalA->insertBefore(CI);
+        primal = primalA;
+      }
 
-      primal->insertBefore(CI);
-
-      Value *shadow;
+      Value *shadow = nullptr;
       switch (mode) {
       case DerivativeMode::ForwardModeError:
       case DerivativeMode::ForwardModeSplit:
       case DerivativeMode::ForwardMode: {
-        Value *sretPt = CI->getArgOperand(0);
-        if (width > 1) {
+        if (retType != DIFFE_TYPE::CONSTANT) {
+          Value *sretPt = CI->getArgOperand(0);
           PointerType *pty = cast<PointerType>(sretPt->getType());
-          if (auto sty = dyn_cast<StructType>(CTy)) {
-            Value *acc = UndefValue::get(
-                ArrayType::get(PointerType::get(sty->getElementType(0),
-                                                pty->getAddressSpace()),
-                               width));
+          auto shadowPtr = Builder.CreatePointerCast(
+              sretPt, PointerType::get(Ty, pty->getAddressSpace()));
+          if (width == 1) {
+            if (primalReturn)
+              shadowPtr = Builder.CreateConstGEP1_64(Ty, shadowPtr, 1);
+            shadow = shadowPtr;
+          } else {
+            Value *acc = UndefValue::get(ArrayType::get(
+                PointerType::get(Ty, pty->getAddressSpace()), width));
             for (size_t i = 0; i < width; ++i) {
-              Value *elem = Builder.CreateStructGEP(sty, sretPt, i);
+              Value *elem =
+                  Builder.CreateConstGEP1_64(Ty, shadowPtr, i + primalReturn);
               acc = Builder.CreateInsertValue(acc, elem, i);
             }
             shadow = acc;
-          } else {
-            EmitFailure(
-                "IllegalReturnType", CI->getDebugLoc(), CI,
-                "Return type of __enzyme_autodiff has to be a struct with",
-                width, "elements of the same type.");
-            return {};
           }
-        } else {
-          shadow = sretPt;
         }
         break;
       }
       case DerivativeMode::ReverseModePrimal:
       case DerivativeMode::ReverseModeCombined:
       case DerivativeMode::ReverseModeGradient: {
-        shadow = CI->getArgOperand(1);
+        if (retType != DIFFE_TYPE::CONSTANT)
+          shadow = CI->getArgOperand(1);
         sret = true;
         break;
       }
       }
 
       args.push_back(primal);
-      args.push_back(shadow);
-      constants.push_back(DIFFE_TYPE::DUP_ARG);
+      if (retType != DIFFE_TYPE::CONSTANT)
+        args.push_back(shadow);
+      if (retType == DIFFE_TYPE::DUP_ARG && !primalReturn && isWriteOnly(fn, 0))
+        retType = DIFFE_TYPE::DUP_NONEED;
+      constants.push_back(retType);
+      retType = DIFFE_TYPE::CONSTANT;
+      primalReturn = false;
     }
 
+    ssize_t interleaved = -1;
+
+    size_t maxsize;
 #if LLVM_VERSION_MAJOR >= 14
-    for (unsigned i = 1 + sret; i < CI->arg_size(); ++i)
+    maxsize = CI->arg_size();
 #else
-    for (unsigned i = 1 + sret; i < CI->getNumArgOperands(); ++i)
+    maxsize = CI->getNumArgOperands();
 #endif
-    {
+    size_t num_args = maxsize;
+    for (unsigned i = 1 + sret; i < maxsize; ++i) {
+      Value *res = CI->getArgOperand(i);
+      auto metaString = getMetadataName(res);
+      if (metaString && startsWith(*metaString, "enzyme_")) {
+        if (*metaString == "enzyme_interleave") {
+          maxsize = i;
+          interleaved = i + 1;
+          break;
+        }
+      }
+    }
+
+    DIFFE_TYPE last_ty = DIFFE_TYPE::DUP_ARG;
+
+    for (ssize_t i = 1 + sret; (size_t)i < maxsize; ++i) {
       Value *res = CI->getArgOperand(i);
       auto metaString = getMetadataName(res);
 #if LLVM_VERSION_MAJOR > 16
@@ -977,7 +1041,6 @@ public:
         } else if (*metaString == "enzyme_const") {
           opt_ty = DIFFE_TYPE::CONSTANT;
         } else if (*metaString == "enzyme_noret") {
-          returnUsed = false;
           skipArg = true;
           break;
         } else if (*metaString == "enzyme_allocated") {
@@ -1006,7 +1069,6 @@ public:
           skipArg = true;
           break;
         } else if (*metaString == "enzyme_primal_return") {
-          primalReturn = true;
           skipArg = true;
           break;
         } else if (*metaString == "enzyme_const_return") {
@@ -1187,7 +1249,10 @@ public:
       overwritten_args[truei] = overwritten;
 
       auto PTy = FT->getParamType(truei);
-      DIFFE_TYPE ty = opt_ty ? *opt_ty : whatType(PTy, mode);
+      DIFFE_TYPE ty =
+          opt_ty ? *opt_ty
+                 : ((interleaved == -1) ? whatType(PTy, mode) : last_ty);
+      last_ty = ty;
 
       constants.push_back(ty);
 
@@ -1251,7 +1316,8 @@ public:
 
       args.push_back(res);
       if (ty == DIFFE_TYPE::DUP_ARG || ty == DIFFE_TYPE::DUP_NONEED) {
-        ++i;
+        if (interleaved == -1)
+          ++i;
 
         Value *res = nullptr;
 #if LLVM_VERSION_MAJOR >= 16
@@ -1261,22 +1327,19 @@ public:
 #endif
 
         for (unsigned v = 0; v < width; ++v) {
-#if LLVM_VERSION_MAJOR >= 14
-          if (i >= CI->arg_size())
-#else
-          if (i >= CI->getNumArgOperands())
-#endif
-          {
+          if ((size_t)((interleaved == -1) ? i : interleaved) >= num_args) {
             EmitFailure("MissingArgShadow", CI->getDebugLoc(), CI,
                         "__enzyme_autodiff missing argument shadow at index ",
-                        i, ", need shadow of type ", *PTy,
+                        *((interleaved == -1) ? &i : &interleaved),
+                        ", need shadow of type ", *PTy,
                         " to shadow primal argument ", *args.back(),
                         " at call ", *CI);
             return {};
           }
 
           // cast diffe
-          Value *element = CI->getArgOperand(i);
+          Value *element =
+              CI->getArgOperand((interleaved == -1) ? i : interleaved);
           if (batch) {
             if (auto elementPtrTy = dyn_cast<PointerType>(element->getType())) {
               element = Builder.CreateBitCast(
@@ -1291,14 +1354,16 @@ public:
             } else {
               EmitFailure(
                   "NonPointerBatch", CI->getDebugLoc(), CI,
-                  "Batched argument at index ", i,
+                  "Batched argument at index ",
+                  *((interleaved == -1) ? &i : &interleaved),
                   " must be of pointer type, found: ", *element->getType());
               return {};
             }
           }
           if (PTy != element->getType()) {
-            element = castToDiffeFunctionArgType(Builder, CI, FT, PTy, i, mode,
-                                                 element, truei);
+            element = castToDiffeFunctionArgType(
+                Builder, CI, FT, PTy, (interleaved == -1) ? i : interleaved,
+                mode, element, truei);
             if (!element) {
               return {};
             }
@@ -1311,13 +1376,16 @@ public:
                                                     element->getType(), width)),
                                                 element, {v});
 
-            if (v < width - 1 && !batch) {
+            if (v < width - 1 && !batch && (interleaved == -1)) {
               ++i;
             }
 
           } else {
             res = element;
           }
+
+          if (interleaved != -1)
+            interleaved++;
         }
 
         args.push_back(res);
@@ -2055,12 +2123,12 @@ public:
     bool has_dynamic_interface = dynamic_interface != nullptr;
     bool needs_interface =
         mode == ProbProgMode::Trace || mode == ProbProgMode::Condition;
-    TraceInterface *interface = nullptr;
+    std::unique_ptr<TraceInterface> interface;
     if (has_dynamic_interface) {
-      interface =
-          new DynamicTraceInterface(dynamic_interface, CI->getFunction());
+      interface = std::make_unique<DynamicTraceInterface>(dynamic_interface,
+                                                          CI->getFunction());
     } else if (needs_interface) {
-      interface = new StaticTraceInterface(F->getParent());
+      interface = std::make_unique<StaticTraceInterface>(F->getParent());
     }
 
     // Find sample function
@@ -2122,7 +2190,7 @@ public:
 
     auto newFunc = Logic.CreateTrace(
         RequestContext(CI, &Builder), F, sampleFunctions, observeFunctions,
-        opt->ActiveRandomVariables, mode, autodiff, interface);
+        opt->ActiveRandomVariables, mode, autodiff, interface.get());
 
     if (!autodiff) {
       auto call = CallInst::Create(newFunc->getFunctionType(), newFunc, args);
@@ -2146,8 +2214,6 @@ public:
     bool status = HandleAutoDiff(
         CI, CI->getCallingConv(), ret, retElemType, dargs, byVal, constants,
         newFunc, DerivativeMode::ReverseModeCombined, *opt, false, calls);
-
-    delete interface;
 
     return status;
   }
@@ -2854,11 +2920,11 @@ public:
         if (auto F = cur->getCalledFunction()) {
           if (!F->empty()) {
             // Garbage collect AC's created
-            SmallVector<AssumptionCache *, 2> ACAlloc;
+            SmallVector<std::unique_ptr<AssumptionCache>, 2> ACAlloc;
             auto getAC = [&](Function &F) -> llvm::AssumptionCache & {
-              auto AC = new AssumptionCache(F);
-              ACAlloc.push_back(AC);
-              return *AC;
+              auto AC = std::make_unique<AssumptionCache>(F);
+              ACAlloc.push_back(std::move(AC));
+              return *ACAlloc.back();
             };
             auto GetTLI =
                 [&](llvm::Function &F) -> const llvm::TargetLibraryInfo & {
@@ -2883,9 +2949,6 @@ public:
                   }
                 }
               }
-            }
-            for (auto AC : ACAlloc) {
-              delete AC;
             }
           }
         }
@@ -2963,9 +3026,12 @@ public:
   bool run(Module &M) {
     Logic.clear();
 
+    for (Function &F : make_early_inc_range(M)) {
+      attributeKnownFunctions(F);
+    }
+
     bool changed = false;
     for (Function &F : M) {
-      attributeKnownFunctions(F);
       if (F.empty())
         continue;
       for (BasicBlock &BB : F) {

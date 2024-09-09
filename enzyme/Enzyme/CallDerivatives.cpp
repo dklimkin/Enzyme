@@ -3021,6 +3021,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             } else if (inLoop) {
               gutils->rematerializedPrimalOrShadowAllocations.push_back(
                   placeholder);
+              if (hasMetadata(&call, "enzyme_fromstack"))
+                isAlloca = true;
               goto endAnti;
             }
           }
@@ -3620,6 +3622,43 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     return true;
   }
 
+  if (funcName == "julia.gc_loaded") {
+    if (gutils->isConstantValue(&call)) {
+      eraseIfUnused(call);
+      return true;
+    }
+    auto ifound = gutils->invertedPointers.find(&call);
+    assert(ifound != gutils->invertedPointers.end());
+
+    auto placeholder = cast<PHINode>(&*ifound->second);
+
+    bool needShadow =
+        DifferentialUseAnalysis::is_value_needed_in_reverse<QueryType::Shadow>(
+            gutils, &call, Mode, oldUnreachable);
+    if (!needShadow) {
+      gutils->invertedPointers.erase(ifound);
+      gutils->erase(placeholder);
+      eraseIfUnused(call);
+      return true;
+    }
+
+    Value *ptr0shadow = gutils->invertPointerM(call.getArgOperand(0), BuilderZ);
+    Value *ptr1shadow = gutils->invertPointerM(call.getArgOperand(1), BuilderZ);
+
+    Value *val = applyChainRule(
+        call.getType(), BuilderZ,
+        [&](Value *v1, Value *v2) -> Value * {
+          Value *args[2] = {v1, v2};
+          return BuilderZ.CreateCall(called, args);
+        },
+        ptr0shadow, ptr1shadow);
+
+    gutils->replaceAWithB(placeholder, val);
+    gutils->erase(placeholder);
+    eraseIfUnused(call);
+    return true;
+  }
+
   if (funcName == "julia.pointer_from_objref") {
     if (gutils->isConstantValue(&call)) {
       eraseIfUnused(call);
@@ -4137,6 +4176,15 @@ bool AdjointGenerator::handleKnownCallDerivatives(
 
         auto rule = [&args](Value *tofree) { args.push_back(tofree); };
         applyChainRule(Builder2, rule, tofree);
+
+#if LLVM_VERSION_MAJOR >= 14
+        for (size_t i = 1; i < call.arg_size(); i++)
+#else
+        for (size_t i = 1; i < call.getNumArgOperands(); i++)
+#endif
+        {
+          args.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
+        }
 
         auto frees = Builder2.CreateCall(free->getFunctionType(), free, args);
         frees->setDebugLoc(gutils->getNewFromOriginal(call.getDebugLoc()));

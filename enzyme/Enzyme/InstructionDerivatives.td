@@ -326,7 +326,7 @@ def : CallPattern<(Op $x),
                   >;
 
 def : CallPattern<(Op $x, $y),
-                  ["hypot", "hypotf", "hypotl"],
+                  ["hypot", "hypotf", "hypotl", "__hypot_finite"],
                   [
                     (FDiv (FMul (DiffeRet), $x), (Call<(SameFunc), [ReadNone,NoUnwind]> $x, $y)),
                     (FDiv (FMul (DiffeRet), $y), (Call<(SameFunc), [ReadNone,NoUnwind]> $x, $y))
@@ -409,6 +409,13 @@ def : CallPattern<(Op $x),
 def : CallPattern<(Op $x),
                   ["atanh", "atanhf", "atanhl", "__nv_atanh", "__nv_atanhf"],
                   [(FDiv (DiffeRet), (FSub (ConstantFP<"1.0"> $x), (FMul $x, $x))  )] ,
+                  (ForwardFromSummedReverse),
+                  [ReadNone, NoUnwind]
+                  >;
+
+def : CallPattern<(Op $x),
+                  ["__nv_fast_expf"],
+                  [(FMul (DiffeRet), (Call<(SameFunc), [ReadNone,NoUnwind]> $x) )],
                   (ForwardFromSummedReverse),
                   [ReadNone, NoUnwind]
                   >;
