@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        llvm: ["14", "15", "16"] #"13", 
+        llvm: ["16"] #"13", "14", "15", 
         build: ["Release"] #, "Debug" "RelWithDebInfo"
         os: [openstack22]
     timeout-minutes: 120 
