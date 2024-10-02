@@ -20,9 +20,10 @@ class CallPattern<dag patternToMatch, list<string> funcNames, list<dag> resultOp
   list<Attribute> FnAttrs = attrs;
 }
 
-class IntrPattern<dag patternToMatch, list<list<string>> funcNames, list<dag> resultOps, dag forwardOps> {
+class IntrPattern<dag patternToMatch, list<list<string>> funcNames, int minVer_, list<dag> resultOps, dag forwardOps> {
   dag PatternToMatch = patternToMatch;
   list<list<string>> names = funcNames;
+  int minVer = minVer_;
   list<dag> ArgDerivatives = resultOps;
   dag ArgDuals = forwardOps;
 }
@@ -334,7 +335,12 @@ def : CallPattern<(Op $x, $y),
                   (ForwardFromSummedReverse),
                   [ReadNone, NoUnwind]
                   >;
-
+def : CallPattern<(Op $x),
+                  ["tanh"],
+                  [(FDiv (DiffeRet), (FMul(Call<(SameTypesFunc<"cosh">), [ReadNone,NoUnwind]> $x):$c, $c))],
+                  (ForwardFromSummedReverse),
+                  [ReadNone, NoUnwind]
+                  >;
 def : CallPattern<(Op $x),
                   ["tanhf"],
                   [(FDiv (DiffeRet), (FMul(Call<(SameTypesFunc<"coshf">), [ReadNone,NoUnwind]> $x):$c, $c))],
@@ -867,55 +873,67 @@ def : CallPattern<(Op (Op $x, $y):$z),
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["tanh"]],
+                  [["tanh"]], 19,
                   [(FDiv (DiffeRet), (FMul(Intrinsic<"cosh"> $x):$c, $c))],
                   (ForwardFromSummedReverse)
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["sin"]],
+                  [["sinh"]], 19,
+                  [(FMul (DiffeRet), (Intrinsic<"cosh"> $x))],
+                  (ForwardFromSummedReverse)
+                  >;
+
+def : IntrPattern<(Op $x),
+                  [["cosh"]], 19,
+                  [(FMul (DiffeRet), (Intrinsic<"sinh"> $x))],
+                  (ForwardFromSummedReverse)
+                  >;
+
+def : IntrPattern<(Op $x),
+                  [["sin"]], 0,
                   [(FMul (DiffeRet), (Intrinsic<"cos"> $x))]  ,
                   (ForwardFromSummedReverse)                
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["cos"]],
+                  [["cos"]], 0,
                   [(FMul (DiffeRet), (FNeg (Intrinsic<"sin"> $x)))]       ,
                   (ForwardFromSummedReverse)           
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["exp"]],
+                  [["exp"]], 0,
                   [(FMul (DiffeRet), (Call<(SameFunc)> $x))],
                   (ForwardFromSummedReverse)                  
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["exp2"], ["nvvm_ex2_approx_ftz_f"], ["nvvm_ex2_approx_f"], ["nvvm_ex2_approx_d"]],
+                  [["exp2"], ["nvvm_ex2_approx_ftz_f"], ["nvvm_ex2_approx_f"], ["nvvm_ex2_approx_d"]], 0,
                   [(FMul (DiffeRet), (FMul (ConstantFP<"0.6931471805599453"> $x), (Call<(SameFunc)> $x)))]                  ,
                   (ForwardFromSummedReverse)
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["log"]],
+                  [["log"]], 0,
                   [(FDiv (DiffeRet), $x)],
                   (ForwardFromSummedReverse)
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["log2"]],
+                  [["log2"]], 0,
                   [(FDiv (DiffeRet), (FMul (ConstantFP<"0.6931471805599453"> $x), $x))],
                   (ForwardFromSummedReverse)
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["log10"]],
+                  [["log10"]], 0,
                   [(FDiv (DiffeRet), (FMul (ConstantFP<"2.302585092994046"> $x), $x))],
                   (ForwardFromSummedReverse)
                   >;
 
 def : IntrPattern<(Op $x, $y),
-                  [["copysign"]],
+                  [["copysign"]], 0,
                   [
                     (FMul (DiffeRet), (FMul (Call<(SameFunc)> (ConstantFP<"1.0"> $x), $x), (Call<(SameFunc)> (ConstantFP<"1.0"> $y), $y))),
                     (InactiveArg)
@@ -924,7 +942,7 @@ def : IntrPattern<(Op $x, $y),
                   >;
 
 def : IntrPattern<(Op $x, $y),
-                  [["minnum"], ["nvvm_fmin_f"], ["nvvm_fmin_d"], ["nvvm_fmin_ftz_f"], ["x86_sse_min_ss", "", "9"], ["x86_sse_min_ps", "", "9"], ["x86_sse2_min_pd", "", ""], ["minimum", "11", ""]],
+                  [["minnum"], ["nvvm_fmin_f"], ["nvvm_fmin_d"], ["nvvm_fmin_ftz_f"], ["x86_sse_min_ss", "", "9"], ["x86_sse_min_ps", "", "9"], ["x86_sse2_min_pd", "", ""], ["minimum", "11", ""]], 0,
                   [
                     (Select (FCmpOLT $x, $y), (DiffeRet), (ConstantFP<"0"> $x)),
                     (Select (FCmpOLT $x, $y), (ConstantFP<"0"> $x), (DiffeRet))
@@ -933,7 +951,7 @@ def : IntrPattern<(Op $x, $y),
                   >;
 
 def : IntrPattern<(Op $x, $y),
-                  [["maxnum"], ["nvvm_fmax_f"], ["nvvm_fmax_d"], ["nvvm_fmax_ftz_f"], ["x86_sse_max_ss", "", "9"], ["x86_sse_max_ps", "", "9"], ["x86_sse2_max_pd", "", ""], ["maximum", "11", ""]],
+                  [["maxnum"], ["nvvm_fmax_f"], ["nvvm_fmax_d"], ["nvvm_fmax_ftz_f"], ["x86_sse_max_ss", "", "9"], ["x86_sse_max_ps", "", "9"], ["x86_sse2_max_pd", "", ""], ["maximum", "11", ""]], 0,
                   [
                     (Select (FCmpOLT $x, $y), (ConstantFP<"0"> $x), (DiffeRet)),
                     (Select (FCmpOLT $x, $y), (DiffeRet), (ConstantFP<"0"> $x))
@@ -952,7 +970,7 @@ def : CallPattern<(Op $x, $y),
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["fabs"]],
+                  [["fabs"]], 0,
                   [
                     (FMul (DiffeRet), (Select (FCmpOLT $x, (ConstantFP<"0"> $x)), (ConstantFP<"-1"> $x), (ConstantFP<"1"> $x)))
                   ],
@@ -960,7 +978,7 @@ def : IntrPattern<(Op $x),
                   >;
 
 def : IntrPattern<(Op $x),
-                  [["sqrt"]],
+                  [["sqrt"]], 0,
                   [(Select (FCmpUEQ $x, (ConstantFP<"0"> $x)), (ConstantFP<"0"> $x), (FDiv (DiffeRet), (FMul (ConstantFP<"2"> $x), (Call<(SameFunc), [ReadNone,NoUnwind]> $x))))],
                   (ForwardFromSummedReverse)
                  >;
@@ -973,7 +991,7 @@ def : CallPattern<(Op (Op $x, $y):$z),
                  >;
 
 def : IntrPattern<(Op $x, $y),
-                  [["pow"]],
+                  [["pow"]], 0,
                   [
                     (CheckedMul (DiffeRet), (FMul $y, (Call<(SameFunc)> $x, (FSub $y, (ConstantFP<"1"> $y))))),
                     (CheckedMul (DiffeRet), (FMul (Call<(SameFunc)> $x, $y), (Intrinsic<"log"> $x)
@@ -983,7 +1001,7 @@ def : IntrPattern<(Op $x, $y),
                  >;
 
 def : IntrPattern<(Op $x, $y),
-                  [["powi"]],
+                  [["powi"]], 0,
                   [
                     (Select 
                       (Or (ICmpEQ $y, (ConstantInt<0> $y) ), (And (GlobalExpr</*needsprimal*/0, /*needsshadow*/0, "ConstantInt::get(Type::getInt1Ty(gutils->newFunc->getContext()), EnzymeStrongZero)">), (FCmpOEQ (DiffeRet), (ConstantFP<"0"> $x) ) ) ),
@@ -998,7 +1016,7 @@ def : IntrPattern<(Op $x, $y),
                  >;
 
 def : IntrPattern<(Op $x, $y, $z),
-                  [["fma"], ["fmuladd"]],
+                  [["fma"], ["fmuladd"]], 0,
                   [
                     (FMul (DiffeRet), $y),
                     (FMul (DiffeRet), $x),
@@ -1008,7 +1026,7 @@ def : IntrPattern<(Op $x, $y, $z),
                  >;
 
 def : IntrPattern<(Op $x, $y),
-                  [["experimental_vector_reduce_v2_fadd", "", "11"], ["vector_reduce_fadd", "12", ""]],
+                  [["experimental_vector_reduce_v2_fadd", "", "11"], ["vector_reduce_fadd", "12", ""]], 0,
                   [
                     (DiffeRet),
                     (VectorSplat (VectorSize (TypeOf $y)), (DiffeRet))

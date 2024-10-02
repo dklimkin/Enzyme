@@ -1802,6 +1802,11 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       break;
     }
     case IntrDerivatives: {
+      auto minVer = pattern->getValueAsInt("minVer");
+      if (minVer != 0) {
+        if (LLVM_VERSION_MAJOR < minVer)
+          continue;
+      }
       bool anyVersion = false;
       for (auto *nameI :
            *cast<ListInit>(pattern->getValueAsListInit("names"))) {
@@ -2632,6 +2637,11 @@ void emitDiffUse(const RecordKeeper &recordKeeper, raw_ostream &os,
       break;
     }
     case IntrDerivatives: {
+      auto minVer = pattern->getValueAsInt("minVer");
+      if (minVer != 0) {
+        if (LLVM_VERSION_MAJOR < minVer)
+          continue;
+      }
       bool anyVersion = false;
       for (auto *nameI :
            *cast<ListInit>(pattern->getValueAsListInit("names"))) {
